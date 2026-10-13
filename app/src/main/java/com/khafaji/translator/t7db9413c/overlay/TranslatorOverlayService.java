@@ -19,9 +19,15 @@ import android.media.ImageReader;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.UtteranceProgressListener;
 import android.util.DisplayMetrics;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -46,21 +52,29 @@ import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-public class TranslatorOverlayService extends Service {
+// الخدمة الموحدة: السحابة العائمة + المحادثة الصوتية المستمرة + الترجمة الفورية للشاشة
+public class TranslatorOverlayService extends Service implements TextToSpeech.OnInitListener {
 
     public static final String EXTRA_RESULT_CODE = "result_code";
     public static final String EXTRA_DATA = "data";
-    private static final String CHANNEL_ID = "translator_overlay";
+    private static final String CHANNEL_ID = "cloudy_channel";
     private static final int NOTIF_ID = 1;
 
     private WindowManager wm;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private TextRecognizer recognizer;
+    private TextRecognizer ocr;
     private Translator translator;
+
+    private TextToSpeech tts;
+    private boolean ttsReady = false;
+    private SpeechRecognizer speech;
+    private volatile boolean listening = false;   // هل المحادثة الصوتية تعمل
+    private volatile boolean speaking = false;    // هل السحابة تتكلم الآن
 
     private MediaProjection projection;
     private VirtualDisplay virtualDisplay;
@@ -76,11 +90,65 @@ public class TranslatorOverlayService extends Service {
     public void onCreate() {
         super.onCreate();
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+        ocr = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
         translator = Translation.getClient(new TranslatorOptions.Builder()
                 .setSourceLanguage(TranslateLanguage.ENGLISH)
                 .setTargetLanguage(TranslateLanguage.ARABIC)
                 .build());
+
+        tts = new TextToSpeech(this, this);
+
+        speech = SpeechRecognizer.createSpeechRecognizer(this);
+        speech.setRecognitionListener(new RecognitionListener() {
+            @Override public void onReadyForSpeech(Bundle params) { }
+            @Override public void onBeginningOfSpeech() { }
+            @Override public void onRmsChanged(float rmsdB) { }
+            @Override public void onBufferReceived(byte[] buffer) { }
+            @Override public void onEndOfSpeech() { }
+            @Override public void onPartialResults(Bundle partialResults) { }
+            @Override public void onEvent(int eventType, Bundle params) { }
+
+            @Override
+            public void onError(int error) {
+                if (listening && !speaking) restartSoon();
+            }
+
+            @Override
+            public void onResults(Bundle results) {
+                ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                if (list != null && !list.isEmpty()) {
+                    handleCommand(list.get(0));
+                }
+                if (listening && !speaking) restartSoon();
+            }
+        });
+    }
+
+    @Override
+    public void onInit(int status) {
+        if (status == TextToSpeech.SUCCESS) {
+            tts.setLanguage(new Locale("ar"));
+            ttsReady = true;
+            tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                @Override public void onStart(String utteranceId) { }
+
+                @Override
+                public void onDone(String utteranceId) {
+                    main.post(() -> {
+                        speaking = false;
+                        if (listening) startListening();
+                    });
+                }
+
+                @Override
+                public void onError(String utteranceId) {
+                    main.post(() -> {
+                        speaking = false;
+                        if (listening) startListening();
+                    });
+                }
+            });
+        }
     }
 
     @Override
@@ -111,42 +179,7 @@ public class TranslatorOverlayService extends Service {
         return intent.getParcelableExtra(EXTRA_DATA);
     }
 
-    private void startCapture(int code, Intent data) {
-        MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-        MediaProjection mp = mpm.getMediaProjection(code, data);
-        mp.registerCallback(new MediaProjection.Callback() {
-            @Override
-            public void onStop() {
-                stopSelf();
-            }
-        }, main);
-
-        DisplayMetrics m = getResources().getDisplayMetrics();
-        ImageReader reader = ImageReader.newInstance(m.widthPixels, m.heightPixels, PixelFormat.RGBA_8888, 2);
-        reader.setOnImageAvailableListener(r -> {
-            Image img = r.acquireLatestImage();
-            if (img == null) return;
-            if (pendingImage != null) pendingImage.close();
-            pendingImage = img;
-        }, main);
-
-        virtualDisplay = mp.createVirtualDisplay("translator_capture",
-                m.widthPixels, m.heightPixels, m.densityDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                reader.getSurface(), null, null);
-        imageReader = reader;
-        projection = mp;
-    }
-
-    private Bitmap imageToBitmap(Image image) {
-        Image.Plane plane = image.getPlanes()[0];
-        int rowPadding = plane.getRowStride() - plane.getPixelStride() * image.getWidth();
-        Bitmap padded = Bitmap.createBitmap(
-                image.getWidth() + rowPadding / plane.getPixelStride(),
-                image.getHeight(), Bitmap.Config.ARGB_8888);
-        padded.copyPixelsFromBuffer(plane.getBuffer());
-        return Bitmap.createBitmap(padded, 0, 0, image.getWidth(), image.getHeight());
-    }
+    // ---------- الفقاعة والتحكم ----------
 
     private void addBubble() {
         int size = dp(56);
@@ -188,7 +221,10 @@ public class TranslatorOverlayService extends Service {
                     wm.updateViewLayout(v, bubbleParams);
                     break;
                 case MotionEvent.ACTION_UP:
-                    if (!moved[0]) onBubbleTap();
+                    if (!moved[0]) {
+                        if (overlay != null) clearOverlay();
+                        else toggleListening();
+                    }
                     break;
             }
             return true;
@@ -198,41 +234,151 @@ public class TranslatorOverlayService extends Service {
         bubble = tv;
     }
 
-    private void onBubbleTap() {
-        if (overlay != null) {
-            clearOverlay();
+    // الضغط على الفقاعة يشغّل المحادثة الصوتية المستمرة أو يوقفها
+    private void toggleListening() {
+        if (listening) {
+            listening = false;
+            speech.stopListening();
+            bubble.setText("ع");
+            toast("توقفت المحادثة");
+        } else {
+            listening = true;
+            bubble.setText("🎤");
+            toast("أنا أسمعك، تكلم الآن");
+            startListening();
+        }
+    }
+
+    private void startListening() {
+        main.post(() -> {
+            if (!listening || speaking) return;
+            Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ar");
+            try {
+                speech.startListening(i);
+            } catch (Exception e) {
+                toast("تعذر تشغيل الميكروفون");
+            }
+        });
+    }
+
+    private void restartSoon() {
+        main.postDelayed(this::startListening, 400);
+    }
+
+    // ---------- الأوامر: ترجمة الشاشة، محادثة جديدة، أو سؤال للذكاء الاصطناعي ----------
+
+    private void handleCommand(String text) {
+        String t = text.trim();
+        if (t.isEmpty()) return;
+
+        if (t.contains("محادثة جديدة")) {
+            AIClient.clearMemory();
+            speak("تم بدء محادثة جديدة");
             return;
         }
-        if (busy) return;
 
+        if (t.contains("ترجم") && t.contains("شاشة")) {
+            translateScreen();
+            return;
+        }
+
+        AIClient.ask(t, new AIClient.Callback() {
+            @Override
+            public void onResult(String reply) {
+                speak(reply);
+            }
+
+            @Override
+            public void onError(String error) {
+                speak("عذراً، حدث خطأ في الاتصال");
+            }
+        });
+    }
+
+    private void speak(String text) {
+        main.post(() -> {
+            if (!ttsReady) return;
+            speaking = true;
+            speech.stopListening();
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "u" + System.currentTimeMillis());
+        });
+    }
+
+    // ---------- التقاط الشاشة وترجمتها ----------
+
+    private void translateScreen() {
+        if (busy) return;
         Image img = pendingImage;
         if (img == null) {
-            toast("حرّك الشاشة قليلاً ثم اضغط الفقاعة مرة أخرى");
+            speak("حرّك الشاشة قليلاً ثم قل ترجم الشاشة مرة أخرى");
             return;
         }
         pendingImage = null;
         busy = true;
         Bitmap bmp = imageToBitmap(img);
         img.close();
+        speak("جاري ترجمة الشاشة");
         translateBitmap(bmp);
+    }
+
+    private void startCapture(int code, Intent data) {
+        MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+        MediaProjection mp = mpm.getMediaProjection(code, data);
+        mp.registerCallback(new MediaProjection.Callback() {
+            @Override
+            public void onStop() {
+                stopSelf();
+            }
+        }, main);
+
+        DisplayMetrics m = getResources().getDisplayMetrics();
+        ImageReader reader = ImageReader.newInstance(m.widthPixels, m.heightPixels, PixelFormat.RGBA_8888, 2);
+        reader.setOnImageAvailableListener(r -> {
+            Image img = r.acquireLatestImage();
+            if (img == null) return;
+            if (pendingImage != null) pendingImage.close();
+            pendingImage = img;
+        }, main);
+
+        virtualDisplay = mp.createVirtualDisplay("cloudy_capture",
+                m.widthPixels, m.heightPixels, m.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader.getSurface(), null, null);
+        imageReader = reader;
+        projection = mp;
+    }
+
+    private Bitmap imageToBitmap(Image image) {
+        Image.Plane plane = image.getPlanes()[0];
+        int rowPadding = plane.getRowStride() - plane.getPixelStride() * image.getWidth();
+        Bitmap padded = Bitmap.createBitmap(
+                image.getWidth() + rowPadding / plane.getPixelStride(),
+                image.getHeight(), Bitmap.Config.ARGB_8888);
+        padded.copyPixelsFromBuffer(plane.getBuffer());
+        return Bitmap.createBitmap(padded, 0, 0, image.getWidth(), image.getHeight());
     }
 
     private void translateBitmap(Bitmap bmp) {
         worker.execute(() -> {
             try {
                 Tasks.await(translator.downloadModelIfNeeded(new DownloadConditions.Builder().build()));
-                Text ocr = Tasks.await(recognizer.process(InputImage.fromBitmap(bmp, 0)));
+                Text result = Tasks.await(ocr.process(InputImage.fromBitmap(bmp, 0)));
 
                 List<Rect> boxes = new ArrayList<>();
                 List<String> texts = new ArrayList<>();
-                for (Text.TextBlock block : ocr.getTextBlocks()) {
+                for (Text.TextBlock block : result.getTextBlocks()) {
                     for (Text.Line line : block.getLines()) {
                         if (line.getBoundingBox() == null || line.getText().trim().isEmpty()) continue;
                         boxes.add(line.getBoundingBox());
                         texts.add(Tasks.await(translator.translate(line.getText())));
                     }
                 }
-                main.post(() -> showOverlay(boxes, texts));
+                main.post(() -> {
+                    showOverlay(boxes, texts);
+                    speak("تمت الترجمة");
+                });
             } catch (Exception e) {
                 toast("تعذرت الترجمة: " + e.getMessage());
             } finally {
@@ -284,16 +430,22 @@ public class TranslatorOverlayService extends Service {
         }
     }
 
+    // ---------- المساعدات والتنظيف ----------
+
     private void startForegroundCompat() {
         NotificationManager nm = getSystemService(NotificationManager.class);
         nm.createNotificationChannel(
-                new NotificationChannel(CHANNEL_ID, "الترجمة الفورية", NotificationManager.IMPORTANCE_LOW));
+                new NotificationChannel(CHANNEL_ID, "السحابة", NotificationManager.IMPORTANCE_LOW));
         Notification notif = new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("الترجمة الفورية تعمل")
+                .setContentTitle("السحابة تعمل")
                 .setSmallIcon(android.R.drawable.ic_menu_view)
                 .build();
         if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+            int types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION;
+            if (Build.VERSION.SDK_INT >= 30) {
+                types |= ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+            }
+            startForeground(NOTIF_ID, notif, types);
         } else {
             startForeground(NOTIF_ID, notif);
         }
@@ -315,6 +467,15 @@ public class TranslatorOverlayService extends Service {
 
     @Override
     public void onDestroy() {
+        listening = false;
+        if (speech != null) {
+            speech.stopListening();
+            speech.destroy();
+        }
+        if (tts != null) {
+            tts.stop();
+            tts.shutdown();
+        }
         clearOverlay();
         if (bubble != null) wm.removeView(bubble);
         bubble = null;
@@ -326,7 +487,7 @@ public class TranslatorOverlayService extends Service {
         projection = null;
         worker.shutdownNow();
         translator.close();
-        recognizer.close();
+        ocr.close();
         super.onDestroy();
     }
 }
