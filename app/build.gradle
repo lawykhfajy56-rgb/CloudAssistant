@@ -7,7 +7,7 @@ android {
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.khafaji.translator.t7db9413c"
+        applicationId "com.khafaji.cloudassistant"
         minSdk 26
         targetSdk 34
         versionCode 1
