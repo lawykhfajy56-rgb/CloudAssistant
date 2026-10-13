@@ -7,6 +7,7 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.animation.ObjectAnimator;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
@@ -33,6 +34,7 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.view.animation.AccelerateDecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.TextView;
@@ -231,6 +233,17 @@ public class TranslatorOverlayService extends Service implements TextToSpeech.On
 
         wm.addView(tv, bubbleParams);
         bubble = tv;
+        startFloating(tv);
+    }
+
+    // الروبوت يطفو صعوداً ونزولاً باستمرار كالسحابة العائمة
+    private void startFloating(View v) {
+        ObjectAnimator anim = ObjectAnimator.ofFloat(v, View.TRANSLATION_Y, (float) -dp(6), (float) dp(6));
+        anim.setDuration(1800);
+        anim.setRepeatCount(ObjectAnimator.INFINITE);
+        anim.setRepeatMode(ObjectAnimator.REVERSE);
+        anim.setInterpolator(new AccelerateDecelerateInterpolator());
+        anim.start();
     }
 
     // الضغط على الفقاعة يشغّل المحادثة الصوتية المستمرة أو يوقفها
