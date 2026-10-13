@@ -21,36 +21,53 @@ public class AIClient {
         void onError(String error);
     }
 
-    // ضع مفتاح Gemini هنا (من aistudio.google.com). إذا تركته كما هو يُستخدم OpenAI
-    private static final String GEMINI_KEY = "PUT_GEMINI_KEY_HERE";
-    private static final String OPENAI_KEY = "PUT_OPENAI_KEY_HERE";
-    private static final String GEMINI_MODEL = "gemini-2.5-flash";
-    private static final String OPENAI_MODEL = "gpt-4.1-mini";
+    private static final String BUSY = "الخدمة مشغولة حالياً، حاول بعد لحظات.";
+
+    // ضع مفاتيحك هنا. أي مفتاح يبقى PUT_... يتم تجاوز مزوده تلقائياً
+    private static final String GEMINI_KEY = "PUT_GEMINI_KEY_HERE";   // aistudio.google.com
+    private static final String OPENAI_KEY = "PUT_OPENAI_KEY_HERE";   // platform.openai.com
+
+    // ترتيب النماذج: الأسرع أولاً. عند فشل نموذج ينتقل التطبيق للذي يليه
+    // النماذج التي تفكّر طويلاً (مثل gpt-5-mini) وضعناها في آخر القائمة لتقليل زمن الانتظار
+    private static final String[][] MODELS = {
+            {"g", "gemini-2.5-flash"},
+            {"o", "gpt-4.1-mini"},
+            {"g", "gemini-3.5-flash-lite"},
+            {"g", "gemini-3.1-flash-lite"},
+            {"o", "gpt-5-mini"},
+            {"g", "gemini-3.6-flash"}
+    };
 
     private static final String SYSTEM =
-            "أنت السحابة، مساعد ذكي على هاتف المستخدم. جاوب دائماً بالعربية وبشكل مختصر في جملتين أو ثلاث، "
-            + "لأن ردك يُقرأ بصوت عالٍ. لا تستخدم رموزاً أو تنسيقاً.";
+            "أنت الخفاجي ai (ويمكن للمستخدم مناداتك بكلودي أيضاً)، مساعد ذكي على هاتف المستخدم. "
+            + "جاوب دائماً بالعربية وبشكل مختصر وواضح في جملتين أو ثلاث، لأن ردك يُقرأ بصوت عالٍ. "
+            + "لا تستخدم رموزاً أو تنسيقاً.";
 
     // عدد الأدوار المحفوظة (كل دور = سؤال + جواب)
     private static final int MAX_TURNS = 10;
-    // كل عنصر = {الدور, النص}، والدور "user" أو "model"
+
+    // ذاكرة المحادثة: كل عنصر = {الدور, النص}، والدور إما "user" أو "model"
     private static final List<String[]> HISTORY = new ArrayList<>();
+
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
+    // الدالة الرئيسية: تُستدعى من الخدمة كما هي
     public static void ask(final String text, final Callback callback) {
-        new Thread(() -> {
-            try {
-                boolean useGemini = !GEMINI_KEY.startsWith("PUT_");
-                String reply = useGemini ? callGemini(text) : callOpenAi(text);
+        step(0, 0, text, new Callback() {
+            @Override
+            public void onResult(String reply) {
                 remember(text, reply);
-                MAIN.post(() -> callback.onResult(reply));
-            } catch (Exception e) {
-                String msg = e.getMessage() == null ? "خطأ غير معروف" : e.getMessage();
-                MAIN.post(() -> callback.onError(msg));
+                callback.onResult(reply);
             }
-        }).start();
+
+            @Override
+            public void onError(String err) {
+                callback.onError(err);
+            }
+        });
     }
 
+    // استدعِها عندما يطلب المستخدم "محادثة جديدة" لمسح الذاكرة
     public static void clearMemory() {
         synchronized (HISTORY) {
             HISTORY.clear();
@@ -73,73 +90,121 @@ public class AIClient {
         }
     }
 
-    private static String callGemini(String text) throws Exception {
-        JSONArray contents = new JSONArray();
-        for (String[] m : snapshot()) {
-            contents.put(new JSONObject()
-                    .put("role", m[0])
-                    .put("parts", new JSONArray().put(new JSONObject().put("text", m[1]))));
+    // جرّب النموذج i؛ عند الفشل انتقل للتالي. بعد نهاية القائمة ننتظر 3 ثوانٍ ونعيد المحاولة مرة واحدة
+    private static void step(final int i, final int round, final String text, final Callback callback) {
+        if (i >= MODELS.length) {
+            if (round < 1) {
+                MAIN.postDelayed(() -> step(0, round + 1, text, callback), 3000L);
+            } else {
+                callback.onError(BUSY);
+            }
+            return;
         }
-        contents.put(new JSONObject()
-                .put("role", "user")
-                .put("parts", new JSONArray().put(new JSONObject().put("text", text))));
 
-        JSONObject body = new JSONObject()
-                .put("contents", contents)
-                .put("system_instruction", new JSONObject()
-                        .put("parts", new JSONArray().put(new JSONObject().put("text", SYSTEM))));
+        String[] m = MODELS[i];
+        boolean gemini = m[0].equals("g");
+        String key = gemini ? GEMINI_KEY : OPENAI_KEY;
+        if (key.startsWith("PUT_")) {
+            step(i + 1, round, text, callback);
+            return;
+        }
 
-        String resp = post("https://generativelanguage.googleapis.com/v1beta/models/" + GEMINI_MODEL + ":generateContent",
-                "x-goog-api-key", GEMINI_KEY, body.toString());
+        call(gemini, m[1], key, text, new Callback() {
+            @Override
+            public void onResult(String reply) {
+                callback.onResult(reply);
+            }
 
-        return new JSONObject(resp).getJSONArray("candidates").getJSONObject(0)
-                .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text");
+            @Override
+            public void onError(String err) {
+                step(i + 1, round, text, callback);
+            }
+        });
     }
 
-    private static String callOpenAi(String text) throws Exception {
-        JSONArray messages = new JSONArray();
-        messages.put(new JSONObject().put("role", "system").put("content", SYSTEM));
-        for (String[] m : snapshot()) {
-            String role = m[0].equals("model") ? "assistant" : "user";
-            messages.put(new JSONObject().put("role", role).put("content", m[1]));
-        }
-        messages.put(new JSONObject().put("role", "user").put("content", text));
+    private static void call(final boolean gemini, final String model, final String key,
+                             final String text, final Callback callback) {
+        new Thread(() -> {
+            try {
+                String url = gemini
+                        ? "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent"
+                        : "https://api.openai.com/v1/chat/completions";
 
-        JSONObject body = new JSONObject().put("model", OPENAI_MODEL).put("messages", messages);
+                HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                conn.setConnectTimeout(10000);
+                conn.setReadTimeout(25000);
+                conn.setRequestMethod("POST");
+                conn.setRequestProperty("Content-Type", "application/json");
+                if (gemini) {
+                    conn.setRequestProperty("x-goog-api-key", key);
+                } else {
+                    conn.setRequestProperty("Authorization", "Bearer " + key);
+                }
+                conn.setDoOutput(true);
 
-        String resp = post("https://api.openai.com/v1/chat/completions",
-                "Authorization", "Bearer " + OPENAI_KEY, body.toString());
+                List<String[]> past = snapshot();
+                JSONObject body = new JSONObject();
 
-        return new JSONObject(resp).getJSONArray("choices").getJSONObject(0)
-                .getJSONObject("message").getString("content");
-    }
+                if (gemini) {
+                    JSONArray contents = new JSONArray();
+                    for (String[] m : past) {
+                        contents.put(new JSONObject()
+                                .put("role", m[0])
+                                .put("parts", new JSONArray().put(new JSONObject().put("text", m[1]))));
+                    }
+                    contents.put(new JSONObject()
+                            .put("role", "user")
+                            .put("parts", new JSONArray().put(new JSONObject().put("text", text))));
+                    body.put("contents", contents);
+                    body.put("system_instruction", new JSONObject()
+                            .put("parts", new JSONArray().put(new JSONObject().put("text", SYSTEM))));
+                    JSONObject gen = new JSONObject().put("maxOutputTokens", 300);
+                    // إيقاف التفكير الداخلي في نماذج 2.5 لتسريع الرد
+                    if (model.startsWith("gemini-2.5")) {
+                        gen.put("thinkingConfig", new JSONObject().put("thinkingBudget", 0));
+                    }
+                    body.put("generationConfig", gen);
+                } else {
+                    JSONArray messages = new JSONArray();
+                    messages.put(new JSONObject().put("role", "system").put("content", SYSTEM));
+                    for (String[] m : past) {
+                        String role = m[0].equals("model") ? "assistant" : "user";
+                        messages.put(new JSONObject().put("role", role).put("content", m[1]));
+                    }
+                    messages.put(new JSONObject().put("role", "user").put("content", text));
+                    body.put("model", model).put("messages", messages);
+                }
 
-    private static String post(String urlStr, String headerName, String headerValue, String body) throws Exception {
-        HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(40000);
-        conn.setRequestMethod("POST");
-        conn.setDoOutput(true);
-        conn.setRequestProperty("Content-Type", "application/json");
-        conn.setRequestProperty(headerName, headerValue);
+                OutputStream os = conn.getOutputStream();
+                os.write(body.toString().getBytes("UTF-8"));
+                os.close();
 
-        OutputStream os = conn.getOutputStream();
-        os.write(body.getBytes("UTF-8"));
-        os.close();
+                int code = conn.getResponseCode();
+                BufferedReader reader = new BufferedReader(new InputStreamReader(
+                        code >= 400 ? conn.getErrorStream() : conn.getInputStream(), "UTF-8"));
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    sb.append(line);
+                }
+                reader.close();
 
-        int code = conn.getResponseCode();
-        BufferedReader reader = new BufferedReader(new InputStreamReader(
-                code >= 400 ? conn.getErrorStream() : conn.getInputStream(), "UTF-8"));
-        StringBuilder sb = new StringBuilder();
-        String line;
-        while ((line = reader.readLine()) != null) {
-            sb.append(line);
-        }
-        reader.close();
+                if (code >= 400) {
+                    throw new Exception("HTTP " + code + ": " + sb);
+                }
 
-        if (code >= 400) {
-            throw new Exception("HTTP " + code + ": " + sb);
-        }
-        return sb.toString();
+                JSONObject json = new JSONObject(sb.toString());
+                final String reply = gemini
+                        ? json.getJSONArray("candidates").getJSONObject(0)
+                              .getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text")
+                        : json.getJSONArray("choices").getJSONObject(0)
+                              .getJSONObject("message").getString("content");
+
+                MAIN.post(() -> callback.onResult(reply));
+            } catch (Exception e) {
+                String msg = e.getMessage() == null ? "خطأ غير معروف" : e.getMessage();
+                MAIN.post(() -> callback.onError(msg));
+            }
+        }).start();
     }
 }

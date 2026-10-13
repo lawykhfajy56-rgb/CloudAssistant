@@ -11,7 +11,6 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
-import android.graphics.drawable.GradientDrawable;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -35,8 +34,11 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import com.khafaji.translator.t7db9413c.R;
 
 import com.google.android.gms.tasks.Tasks;
 import com.google.mlkit.common.model.DownloadConditions;
@@ -81,7 +83,7 @@ public class TranslatorOverlayService extends Service implements TextToSpeech.On
     private ImageReader imageReader;
     private Image pendingImage;
 
-    private TextView bubble;
+    private View bubble;
     private WindowManager.LayoutParams bubbleParams;
     private FrameLayout overlay;
     private volatile boolean busy = false;
@@ -182,16 +184,13 @@ public class TranslatorOverlayService extends Service implements TextToSpeech.On
     // ---------- الفقاعة والتحكم ----------
 
     private void addBubble() {
-        int size = dp(56);
-        TextView tv = new TextView(this);
-        tv.setText("ع");
-        tv.setGravity(Gravity.CENTER);
-        tv.setTextColor(Color.WHITE);
-        tv.setTextSize(20);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setShape(GradientDrawable.OVAL);
-        bg.setColor(Color.parseColor("#CC1E88E5"));
-        tv.setBackground(bg);
+        int size = dp(64);
+        // الفقاعة هي الروبوت (res/drawable/robot.png)
+        ImageView tv = new ImageView(this);
+        tv.setImageResource(R.drawable.robot);
+        tv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        tv.setContentDescription("الخفاجي ai");
+        tv.setAlpha(0.9f);
 
         bubbleParams = new WindowManager.LayoutParams(size, size, overlayType(),
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
@@ -239,14 +238,26 @@ public class TranslatorOverlayService extends Service implements TextToSpeech.On
         if (listening) {
             listening = false;
             speech.stopListening();
-            bubble.setText("ع");
+            setBubbleActive(false);
             toast("توقفت المحادثة");
         } else {
             listening = true;
-            bubble.setText("🎤");
+            setBubbleActive(true);
             toast("أنا أسمعك، تكلم الآن");
             startListening();
         }
+    }
+
+    // عند الاستماع: الروبوت يكبر ويتوهج أكثر
+    private void setBubbleActive(boolean active) {
+        if (bubble == null) return;
+        bubble.animate().cancel();
+        bubble.animate()
+                .scaleX(active ? 1.15f : 1f)
+                .scaleY(active ? 1.15f : 1f)
+                .alpha(active ? 1f : 0.9f)
+                .setDuration(200)
+                .start();
     }
 
     private void startListening() {

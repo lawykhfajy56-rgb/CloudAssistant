@@ -7,7 +7,7 @@ android {
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.khafaji.cloudassistant"
+        applicationId "com.khafaji.translator.t7db9413c"
         minSdk 26
         targetSdk 34
         versionCode 1
@@ -31,9 +31,4 @@ dependencies {
     implementation 'com.google.mlkit:text-recognition:16.0.1'
     implementation 'com.google.mlkit:translate:17.0.3'
     implementation 'com.google.android.gms:play-services-tasks:18.2.0'
-}
-
-configurations.all {
-    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'
-    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8'
 }
